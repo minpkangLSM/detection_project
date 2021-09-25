@@ -1,30 +1,25 @@
 import os
-from PIL import Image
 import numpy as np
+from PIL import Image
 import tensorflow as tf
-from tensorflow.keras.layers import Lambda
-from tensorflow.keras.layers import multiply
-from tensorflow.keras.layers import Conv2D
-from tensorflow.keras.layers import Conv2DTranspose
-from tensorflow.keras.layers import MaxPool2D
-from tensorflow.keras.layers import Activation
-from tensorflow.keras.layers import BatchNormalization
+from tensorflow import keras
 from tensorflow.keras.layers import Add
+from tensorflow.keras.layers import Conv2D
+from tensorflow.keras.layers import MaxPool2D
+from tensorflow.keras.layers import Conv2DTranspose
+from tensorflow.keras.layers import BatchNormalization
+from tensorflow.keras.layers import Activation
 from tensorflow.keras.layers import Concatenate
 from tensorflow.keras.losses import SparseCategoricalCrossentropy
-from tensorflow.keras.metrics import MeanIoU
-from tensorflow.python.ops import math_ops
-from tensorflow.python.framework import ops
-from tensorflow.python.keras import backend as K
-from tensorflow.python.keras.utils import losses_utils
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
+
 # Optionset
 config = tf.compat.v1.ConfigProto()
 config.gpu_options.allow_growth = True
 config.log_device_placement = True
 session = tf.compat.v1.InteractiveSession(config=config)
 
-class UpdatedMeanIoU(MeanIoU) :
+class UpdatedMeanIoU(keras.metrics.MeanIoU) :
     def __init__(self,
                  y_true = None,
                  y_pred = None,
@@ -37,70 +32,8 @@ class UpdatedMeanIoU(MeanIoU) :
         y_pred = tf.math.argmax(y_pred, axis=-1)
         return super().update_state(y_true, y_pred, sample_weight)
 
-def cust_loss(target, output):
-    target = tf.cast(target, tf.uint8)
-    target = tf.one_hot(target, 2)
-    target = tf.squeeze(target, 3)
-    return -tf.reduce_sum(target*output, len(output.get_shape())-1)
-
-def dice_loss(y_true, y_pred):
-
-    y_true = tf.cast(y_true, tf.int64)
-    y_true = K.one_hot(y_true, 2)
-
-    y_true = K.flatten(y_true)
-    y_pred = K.flatten(y_pred)
-
-    intersection = tf.reduce_sum(y_pred*y_true)
-    dice_coef = (2.*intersection+K.epsilon()) / (K.sum(y_pred)+K.sum(y_true)+K.epsilon())
-
-    dice_loss = tf.reduce_mean(1-dice_coef)
-    return dice_loss
-
-def gen_dice(y_true, y_pred, eps=1e-6):
-    """both tensors are [b, h, w, classes] and y_pred is in logit form"""
-
-    # [b, h, w, classes]
-    pred_tensor = tf.nn.softmax(y_pred)
-    y_true_shape = tf.shape(y_true)
-
-    # [b, h*w, classes]
-    y_true = tf.reshape(y_true, [-1, y_true_shape[1]*y_true_shape[2], y_true_shape[3]])
-    y_pred = tf.reshape(pred_tensor, [-1, y_true_shape[1]*y_true_shape[2], y_true_shape[3]])
-
-    # [b, classes]
-    # count how many of each class are present in
-    # each image, if there are zero, then assign
-    # them a fixed weight of eps
-    counts = tf.reduce_sum(y_true, axis=1)
-    weights = 1. / (counts)
-    weights = tf.where(tf.math.is_finite(weights), weights, eps)
-
-    multed = tf.reduce_sum(y_true * y_pred, axis=1)
-    summed = tf.reduce_sum(y_true + y_pred, axis=1)
-
-    # [b]
-    numerators = tf.reduce_sum(weights*multed, axis=-1)
-    denom = tf.reduce_sum(weights*summed, axis=-1)
-    dices = 1. - 2. * numerators / denom
-    dices = tf.where(tf.math.is_finite(dices), dices, tf.zeros_like(dices))
-    return tf.reduce_mean(dices)
-
-def class2color(mask, name):
-    mask = mask.reshape(512, 512, 2)
-    mask = np.argmax(mask, axis=-1)
-    mask_zero = np.zeros([512, 512, 3])
-    name = name+".png"
-    for class_num in range(2):
-        mask_label = mask == class_num
-        if class_num == 0:
-            mask_zero[mask_label] = [0, 0, 0]
-        elif class_num == 1:
-            mask_zero[mask_label] = [255, 255, 255]
-
-    print(name)
-    im = Image.fromarray(mask_zero.astype(np.uint8))
-    im.save("./DRU_rgbd_f_pred/"+name, 'png')
+def make_variables(k, initializer):
+  return tf.Variable(initializer(shape=[k], dtype=tf.float32))
 
 def Resblock_bn_DRU(input_tensor, channels, weight_decay = None):
 
@@ -131,26 +64,107 @@ def Resblock_bn_DRU(input_tensor, channels, weight_decay = None):
 
     return active3
 
-class DeepResUNet :
+def spatial_attention_module(input_tensor) :
+
+    tensor_shape = input_tensor.shape
+
+    # "we first apply convolution layer to obtain features of dimension reduction."
+    A = Conv2D(filters=tensor_shape[3]//8,
+               kernel_size=(3,3),
+               padding="same")(input_tensor)
+
+    # "we first feed it into a convolution layers to generate two new feature maps B and C, respectively."
+    B = Conv2D(filters=A.shape[3],
+               kernel_size=(3,3),
+               padding="same")(A)
+    C = Conv2D(filters=A.shape[3],
+               kernel_size=(3,3),
+               padding="same")(A)
+    D = Conv2D(filters=A.shape[3],
+               kernel_size=(3,3),
+               padding="same")(A)
+
+    B = tf.reshape(B,
+                   shape=[-1, A.shape[1]*A.shape[2], A.shape[3]])
+    C = tf.reshape(C,
+                   shape=[-1, A.shape[1]*A.shape[2], A.shape[3]])
+    D = tf.reshape(D,
+                   shape=[-1, A.shape[1]*A.shape[2], A.shape[3]])
+
+    # Sptial attention mask : C shape : (Batch, N(HXW), C), B shape : (Batch, N, C)
+    _S = tf.matmul(C, tf.transpose(B, [0, 2, 1]))
+    S = tf.keras.activations.softmax(_S, axis=2)
+
+    attention_score = tf.matmul(tf.transpose(D, [0, 2, 1]), tf.transpose(S, [0, 2, 1]))
+    attention_score = tf.reshape(attention_score, shape=[-1, A.shape[1], A.shape[2], A.shape[3]])
+    # tf.Variable(tf.zeros_initializer(shape=1)) #TypeError: object() takes no parameters
+    scale = make_variables(1, tf.zeros_initializer())
+    E_spatial = scale*attention_score+A
+
+    return E_spatial
+
+def channel_attention_module(input_tensor):
+
+    tensor_shape = input_tensor.shape
+
+    A = Conv2D(filters=tensor_shape[3]//8,
+               kernel_size=(3,3),
+               padding="same")(input_tensor)
+
+    A_1 = tf.reshape(A,
+                     shape=[-1, A.shape[1]*A.shape[2], A.shape[3]])
+    A_2 = tf.reshape(A,
+                     shape=[-1, A.shape[1]*A.shape[2], A.shape[3]])
+    A_3 = tf.reshape(A,
+                     shape=[-1, A.shape[1]*A.shape[2], A.shape[3]])
+
+    # Channel attention mask : shape of A_1~3 : [Batch, N(HxW), C]
+    _X = tf.matmul(tf.transpose(A_1, [0, 2, 1]), A_2)
+    X = tf.keras.activations.softmax(_X, axis=2)
+
+    attention_score = tf.matmul(A_3, tf.transpose(X, [0, 2, 1]))
+    attention_score = tf.reshape(attention_score, shape=[-1, A.shape[1], A.shape[2], A.shape[3]])
+    scale = make_variables(1, tf.zeros_initializer())
+    E_channel = scale*attention_score+A
+
+    return E_channel
+
+def class2color(mask, name):
+    mask = mask.reshape(512, 512, 2)
+    mask = np.argmax(mask, axis=-1)
+    mask_zero = np.zeros([512, 512, 3])
+    name = name+".png"
+    for class_num in range(2):
+        mask_label = mask == class_num
+        if class_num == 0:
+            mask_zero[mask_label] = [0, 0, 0]
+        elif class_num == 1:
+            mask_zero[mask_label] = [255, 255, 255]
+
+    print(name)
+    im = Image.fromarray(mask_zero.astype(np.uint8))
+    im.save("./DA_DRU_rgbd_f_pred/"+name, 'png')
+
+class DA_DeepResUNet :
     """
     CODE INFO
     """
 
-    def __init__(self, input_shape, offground_shape, ground_shape, lr, num_classes):
+    def __init__(self, input_shape, ndsm_shape, lr, batch_size, num_classes):
         self.input_shape = input_shape
-        self.offground_shape = offground_shape
-        self.ground_shape = ground_shape
+        self.ndsm_shape = ndsm_shape
         self.lr = lr
+        self.batch_size=batch_size
         self.num_classes = num_classes
-        #self.weight_decay = tf.keras.regularizers.L1L2(weight_decay)
 
     def build_net(self):
 
         input = tf.keras.Input(self.input_shape)
-        offground = tf.keras.Input(self.offground_shape)
-        ground = tf.keras.Input(self.ground_shape)
-        ndsm = offground - ground
-        rgbd = Concatenate()([input, ndsm])
+        ndsm = tf.keras.Input(self.ndsm_shape)
+        # fake_noise = tf.random.uniform(shape=[self.batch_size, 512, 512, 1], maxval=235, dtype=tf.dtypes.int32)
+        # fake_noise = tf.cast(fake_noise, dtype=tf.dtypes.float32)
+        # ndsm_fake = ndsm + fake_noise
+        rgbd = Concatenate(axis=-1)([input, ndsm])
 
         # Encoder - Input parts : 5x5 - Pool2
         En_conv5x5 = Conv2D(filters=128,
@@ -196,13 +210,47 @@ class DeepResUNet :
                                   64)
         En_add4 = Add()([En_rb8, En_pool3])
 
+
+        # Spatial Attention Map
+        E_spatial = spatial_attention_module(En_add4)
+        E_spatial = Conv2D(filters=E_spatial.shape[3],
+                           padding="same",
+                           kernel_size=3,
+                           kernel_initializer="he_normal",
+                           name="conv_e_spatial_1")(E_spatial)
+        E_spatial = BatchNormalization()(E_spatial)
+        E_spatial = Activation(activation='relu')(E_spatial)
+        E_spatial = Conv2D(filters=E_spatial.shape[3],
+                           padding="same",
+                           kernel_size=3,
+                           kernel_initializer="he_normal",
+                           name="conv_e_spatial_2")(E_spatial)
+
+        # Channel Attention Map
+        E_channel = channel_attention_module(En_add4)
+        E_channel = Conv2D(filters=E_channel.shape[3],
+                           padding="same",
+                           kernel_size=3,
+                           kernel_initializer="he_normal",
+                           name="conv_e_channel_1")(E_channel)
+        E_channel = BatchNormalization()(E_channel)
+        E_channel = Activation(activation='relu')(E_channel)
+        E_channel = Conv2D(filters=E_spatial.shape[3],
+                           padding="same",
+                           kernel_size=3,
+                           kernel_initializer="he_normal",
+                           name="conv_e_channel_2")(E_channel)
+
+        # 1/4
+        sum_fusion = tf.add(E_spatial, E_channel)
+
         # Decoder
         # block5 : tc, concat, conv1, rb, rb
         De_up1 = Conv2DTranspose(
             filters=128,
             kernel_size=(2,2),
             strides=(2,2)
-        )(En_add4)
+        )(sum_fusion)
         De_concat1 = Concatenate()([De_up1, En_add3])
         De_conv1x1_1 = Conv2D(
             filters=128,
@@ -289,7 +337,7 @@ class DeepResUNet :
 
         De_last = Activation(activation="softmax")(De_conv1x1_5)
 
-        model = tf.keras.Model(inputs=(input, offground, ground), outputs=De_last)
+        model = tf.keras.Model(inputs=(input, ndsm), outputs=De_last)
 
         model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=self.lr),
@@ -299,61 +347,62 @@ class DeepResUNet :
 
         return model
 
-if __name__ == "__main__" :
+if __name__ == "__main__":
 
     INPUT_SHAPE = (512, 512, 3)
-    OFFGROUND_SHAPE = (512, 512, 1)
-    GROUND_SHAPE = (512, 512, 1)
+    NDSM_SHAPE = (512, 512, 1)
     NUM_CLASSES = 2
-    start_lr = 0.001
-    end_lr = 0.00001
-    decay_step = 100
-    LR = tf.keras.optimizers.schedules.PolynomialDecay(
-        start_lr,
-        decay_steps=decay_step,
-        end_learning_rate=end_lr,
-        power=0.5
-    )
-    BATCH_SIZE = 4
-    seed=10
+    # start_lr = 0.001
+    # end_lr = 0.00001
+    # decay_step = 100
+    # LR = tf.keras.optimizers.schedules.PolynomialDecay(
+    #     start_lr,
+    #     decay_steps=decay_step,
+    #     end_learning_rate=end_lr,
+    #     power=0.5
+    # )
+    LR = 0.00001
+    BATCH_SIZE = 3
+    seed = 10
 
-    # # train
-    # image_datagen = ImageDataGenerator(
+    # train
+    image_datagen = ImageDataGenerator(
+        horizontal_flip=True,
+        vertical_flip=True,
+    )
+    # fake_mask_datagen = ImageDataGenerator(
     #     horizontal_flip=True,
     #     vertical_flip=True,
+    #     rescale=20
     # )
-    # mask_datagen_main = ImageDataGenerator(
-    #     horizontal_flip=True,
-    #     vertical_flip=True,
+    mask_datagen = ImageDataGenerator(
+        horizontal_flip=True,
+        vertical_flip=True,
+    )
+    ndsm_datagen = ImageDataGenerator(
+        horizontal_flip=True,
+        vertical_flip=True,
+    )
+
+    image_generator = image_datagen.flow_from_directory(
+        directory="./renewal_dataset_0324/train/images",
+        class_mode=None,
+        seed=seed,
+        shuffle=True,
+        target_size=(512, 512),
+        batch_size=BATCH_SIZE
+    )
+    # fake_mask_generator = fake_mask_datagen.flow_from_directory(
+    #     directory="./renewal_dataset_0324/train/labels",
+    #     class_mode=None,
+    #     seed=seed,
+    #     shuffle=True,
+    #     target_size=(512, 512),
+    #     color_mode="grayscale",
+    #     batch_size=BATCH_SIZE,
     # )
-    # offground_datagen_main = ImageDataGenerator(
-    #     horizontal_flip=True,
-    #     vertical_flip=True,
-    # )
-    # ground_datagen_main = ImageDataGenerator(
-    #     horizontal_flip=True,
-    #     vertical_flip=True,
-    # )
-    #
-    # image_generator = image_datagen.flow_from_directory(
-    #    directory="./renewal_dataset_0324/train/images",
-    #    class_mode=None,
-    #    seed=seed,
-    #    shuffle=True,
-    #    target_size=(512, 512),
-    #    batch_size=BATCH_SIZE
-    # )
-    # mask_generator = mask_datagen_main.flow_from_directory(
-    #    directory="./renewal_dataset_0324/train/labels",
-    #    class_mode=None,
-    #    seed=seed,
-    #    shuffle=True,
-    #    target_size=(512, 512),
-    #    color_mode="grayscale",
-    #    batch_size=BATCH_SIZE
-    # )
-    # offground_generator = offground_datagen_main.flow_from_directory(
-    #     directory="./renewal_dataset_0324/train/offground",
+    # mask_generator = mask_datagen.flow_from_directory(
+    #     directory="./renewal_dataset_0324/train/labels",
     #     class_mode=None,
     #     seed=seed,
     #     shuffle=True,
@@ -361,8 +410,9 @@ if __name__ == "__main__" :
     #     color_mode="grayscale",
     #     batch_size=BATCH_SIZE
     # )
-    # ground_generator = ground_datagen_main.flow_from_directory(
-    #     directory="./renewal_dataset_0324/train/ground",
+
+    # ndsm_generator = ndsm_datagen.flow_from_directory(
+    #     directory="./renewal_dataset_0324/train/q_ndsm",
     #     class_mode=None,
     #     seed=seed,
     #     shuffle=True,
@@ -370,12 +420,15 @@ if __name__ == "__main__" :
     #     color_mode="grayscale",
     #     batch_size=BATCH_SIZE
     # )
-    #
+
     # # valid
     # valid_img_datagen = ImageDataGenerator()
+    # # fake_valid_msk_datagen = ImageDataGenerator(
+    # #     rescale=20
+    # # )
     # valid_msk_datagen = ImageDataGenerator()
-    # valid_offground_datagen = ImageDataGenerator()
-    # valid_ground_datagen = ImageDataGenerator()
+    #
+    # valid_ndsm_datagen = ImageDataGenerator()
     #
     # valid_img_generator = valid_img_datagen.flow_from_directory(
     #     directory="./renewal_dataset_0324/valid/images",
@@ -383,6 +436,15 @@ if __name__ == "__main__" :
     #     seed=seed,
     #     shuffle=True,
     #     class_mode=None,
+    #     batch_size=BATCH_SIZE
+    # )
+    # fake_valid_mask_generator = fake_valid_msk_datagen.flow_from_directory(
+    #     directory="./renewal_dataset_0324/valid/labels",
+    #     target_size=(512, 512),
+    #     seed=seed,
+    #     shuffle=True,
+    #     class_mode=None,
+    #     color_mode="grayscale",
     #     batch_size=BATCH_SIZE
     # )
     # valid_mask_generator = valid_msk_datagen.flow_from_directory(
@@ -394,8 +456,8 @@ if __name__ == "__main__" :
     #     color_mode="grayscale",
     #     batch_size=BATCH_SIZE
     # )
-    # valid_offground_generator = valid_offground_datagen.flow_from_directory(
-    #     directory="./renewal_dataset_0324/valid/offground",
+    # valid_ndsm_generator = valid_ndsm_datagen.flow_from_directory(
+    #     directory="./renewal_dataset_0324/valid/q_ndsm",
     #     target_size=(512, 512),
     #     seed=seed,
     #     shuffle=True,
@@ -403,62 +465,56 @@ if __name__ == "__main__" :
     #     color_mode="grayscale",
     #     batch_size=BATCH_SIZE
     # )
-    # valid_ground_generator = valid_ground_datagen.flow_from_directory(
-    #     directory="./renewal_dataset_0324/valid/ground",
-    #     target_size=(512, 512),
-    #     seed=seed,
-    #     shuffle=True,
-    #     class_mode=None,
-    #     color_mode="grayscale",
-    #     batch_size=BATCH_SIZE
-    # )
-    #
+
     # def create_train_generator(img, offground, ground, label):
     #     while True:
     #         for x1, x2, x3, x4 in zip(img, offground, ground, label):
     #             yield (x1, x2, x3), x4
+
+    # def create_train_generator(img, fake_label, label):
+    #     while True:
+    #         for x1, x2, x3 in zip(img, fake_label, label):
+    #             yield (x1, x2), x3
     #
-    # train_gen = create_train_generator(image_generator, offground_generator, ground_generator, mask_generator)
-    # valid_gen = create_train_generator(valid_img_generator, valid_offground_generator, valid_ground_generator, valid_mask_generator)
+    # train_gen = create_train_generator(image_generator, ndsm_generator, mask_generator)
+    # valid_gen = create_train_generator(valid_img_generator, valid_ndsm_generator, valid_mask_generator)
 
     pred_img_datagen = ImageDataGenerator()
     pred_ground_datagen = ImageDataGenerator()
     pred_offground_datagen = ImageDataGenerator()
 
-    pred_img_generator=pred_img_datagen.flow_from_directory(
-        directory="./renewal_dataset_0326_myeonmok/images",
+    pred_img_generator = pred_img_datagen.flow_from_directory(
+        directory="./data_for_sangam_pred/dist1_clipped",
         target_size=(512, 512),
         batch_size=1,
         shuffle=False,
         class_mode=None
     )
-    pred_ground_generator=pred_ground_datagen.flow_from_directory(
-        directory="./renewal_dataset_0326_myeonmok/grounds",
-        target_size=(512, 512),
-        batch_size=1,
-        shuffle=False,
-        color_mode="grayscale",
-        class_mode=None
-    )
-    pred_offground_generator=pred_offground_datagen.flow_from_directory(
-        directory="./renewal_dataset_0326_myeonmok/offgrounds",
+    pred_ground_generator = pred_ground_datagen.flow_from_directory(
+        directory="./data_for_sangam_pred/dist1_clipped_dtm",
         target_size=(512, 512),
         batch_size=1,
         shuffle=False,
         color_mode="grayscale",
         class_mode=None
     )
-
-    def create_pred_generator(img, offground, ground):
-        while True:
-            for x1, x2, x3 in zip(img, offground, ground):
-                yield (x1, x2, x3)
-
+    pred_offground_generator = pred_offground_datagen.flow_from_directory(
+        directory="./data_for_sangam_pred/dist1_clipped_dsm",
+        target_size=(512, 512),
+        batch_size=1,
+        shuffle=False,
+        color_mode="grayscale",
+        class_mode=None
+    )
     pred_gen = create_pred_generator(pred_img_generator, pred_offground_generator, pred_ground_generator)
 
-    DeepResUNet = DeepResUNet(input_shape=INPUT_SHAPE, offground_shape=OFFGROUND_SHAPE, ground_shape=GROUND_SHAPE, lr=LR, num_classes=NUM_CLASSES)
-    model = DeepResUNet.build_net()
-    model.load_weights("./DRU_rgbd_weights_float/DRU_91.hdf5")
+    DA_DRU = DA_DeepResUNet(input_shape=INPUT_SHAPE,
+                            ndsm_shape=NDSM_SHAPE,
+                            lr=LR,
+                            batch_size=BATCH_SIZE,
+                            num_classes=NUM_CLASSES)
+    model = DA_DRU.build_net()
+    model.load_weights("./DRU_DA_rgbd_callbacks/weights/DRU_DA_rgbd_34.hdf5")
     model.summary()
 
     # # visualization
@@ -482,18 +538,17 @@ if __name__ == "__main__" :
     # VISUALIZE = tf.keras.callbacks.LambdaCallback(on_epoch_end=log_val_img)
 
     # callbacks = [
-    #     tf.keras.callbacks.ModelCheckpoint(filepath="./DRU_rgbd_weights_float/DRU_{epoch:02d}.hdf5"),
-    #     tf.keras.callbacks.TensorBoard(log_dir="./DRU_rgbd_logs_float", update_freq="batch"),
+    #     tf.keras.callbacks.ModelCheckpoint(filepath="./DRU_DA_rgbd_callbacks/finetune_weights/DRU_DA_rgbd_{epoch:02d}.hdf5"),
+    #     tf.keras.callbacks.TensorBoard(log_dir="./DRU_DA_rgbd_callbacks/finetune_logs", update_freq="batch"),
     #     # VISUALIZE
     #     # keras.callbacks.LearningRateScheduler(scheduler, verbose=1)
     # ]
-    #
     # model.fit(
     #     train_gen,
     #     validation_data=valid_gen,
     #     validation_batch_size=BATCH_SIZE,
-    #     validation_steps=valid_img_generator.samples/BATCH_SIZE,
-    #     steps_per_epoch=mask_generator.samples/BATCH_SIZE,
+    #     validation_steps=valid_img_generator.samples / BATCH_SIZE,
+    #     steps_per_epoch=mask_generator.samples / BATCH_SIZE,
     #     epochs=100,
     #     callbacks=[callbacks]
     # )

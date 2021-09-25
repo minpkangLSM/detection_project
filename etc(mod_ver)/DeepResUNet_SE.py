@@ -1,17 +1,20 @@
 import os
 import numpy as np
 import tensorflow as tf
+from PIL import Image
 from tensorflow.keras.layers import Lambda
 from tensorflow.keras.layers import multiply
 from tensorflow.keras.layers import Conv2D
 from tensorflow.keras.layers import Conv2DTranspose
 from tensorflow.keras.layers import MaxPool2D
+from tensorflow.keras.layers import GlobalAvgPool2D
 from tensorflow.keras.layers import Activation
 from tensorflow.keras.layers import BatchNormalization
 from tensorflow.keras.layers import Add
 from tensorflow.keras.layers import Concatenate
 from tensorflow.keras.losses import SparseCategoricalCrossentropy
 from tensorflow.keras.metrics import MeanIoU
+from tensorflow.keras.layers import Dense
 from tensorflow.python.ops import math_ops
 from tensorflow.python.framework import ops
 from tensorflow.python.keras import backend as K
@@ -37,56 +40,42 @@ class UpdatedMeanIoU(MeanIoU) :
         y_pred = tf.math.argmax(y_pred, axis=-1)
         return super().update_state(y_true, y_pred, sample_weight)
 
-def cust_loss(target, output):
-    target = tf.cast(target, tf.uint8)
-    target = tf.one_hot(target, 2)
-    target = tf.squeeze(target, 3)
-    return -tf.reduce_sum(target*output, len(output.get_shape())-1)
+def class2color(mask, name):
+    mask = mask.reshape(512, 512, 2)
+    mask = np.argmax(mask, axis=-1)
+    mask_zero = np.zeros([512, 512, 3])
+    name = name+".png"
+    for class_num in range(2):
+        mask_label = mask == class_num
+        if class_num == 0:
+            mask_zero[mask_label] = [0, 0, 0]
+        elif class_num == 1:
+            mask_zero[mask_label] = [255, 255, 255]
 
-def dice_loss(y_true, y_pred):
+    im = Image.fromarray(mask_zero.astype(np.uint8))
+    im.save("./data_for_sangam_pred/dist5_pred/"+name, 'png')
 
-    y_true = tf.cast(y_true, tf.int64)
-    y_true = K.one_hot(y_true, 2)
+def se_module(input_feature,
+              r=16):
+    """
 
-    y_true = K.flatten(y_true)
-    y_pred = K.flatten(y_pred)
+    :param input_feature:
+    :param bottle_neck:
+    :return:
+    """
+    feature_shape = input_feature.shape
+    bottle_neck_ratio = int(feature_shape[-1]/r)
 
-    intersection = tf.reduce_sum(y_pred*y_true)
-    dice_coef = (2.*intersection+K.epsilon()) / (K.sum(y_pred)+K.sum(y_true)+K.epsilon())
+    squeeze = GlobalAvgPool2D()(input_feature)
+    FCL1 = Dense(units=bottle_neck_ratio)(squeeze)
+    non_lin1 = Activation(activation="relu")(FCL1)
 
-    dice_loss = tf.reduce_mean(1-dice_coef)
-    return dice_loss
+    FCL2 = Dense(units=feature_shape[-1])(non_lin1)
+    non_lin2 = Activation(activation="sigmoid")(FCL2)
 
-def gen_dice(y_true, y_pred, eps=1e-6):
-    """both tensors are [b, h, w, classes] and y_pred is in logit form"""
+    return non_lin2
 
-    # [b, h, w, classes]
-    pred_tensor = tf.nn.softmax(y_pred)
-    y_true_shape = tf.shape(y_true)
-
-    # [b, h*w, classes]
-    y_true = tf.reshape(y_true, [-1, y_true_shape[1]*y_true_shape[2], y_true_shape[3]])
-    y_pred = tf.reshape(pred_tensor, [-1, y_true_shape[1]*y_true_shape[2], y_true_shape[3]])
-
-    # [b, classes]
-    # count how many of each class are present in
-    # each image, if there are zero, then assign
-    # them a fixed weight of eps
-    counts = tf.reduce_sum(y_true, axis=1)
-    weights = 1. / (counts)
-    weights = tf.where(tf.math.is_finite(weights), weights, eps)
-
-    multed = tf.reduce_sum(y_true * y_pred, axis=1)
-    summed = tf.reduce_sum(y_true + y_pred, axis=1)
-
-    # [b]
-    numerators = tf.reduce_sum(weights*multed, axis=-1)
-    denom = tf.reduce_sum(weights*summed, axis=-1)
-    dices = 1. - 2. * numerators / denom
-    dices = tf.where(tf.math.is_finite(dices), dices, tf.zeros_like(dices))
-    return tf.reduce_mean(dices)
-
-def Resblock_bn_DRU(input_tensor, channels, weight_decay = None):
+def Resblock_bn_DRU_SE(input_tensor, channels, weight_decay = None):
 
     conv1 = Conv2D(filters=channels,
                    kernel_size=(3,3),
@@ -110,25 +99,30 @@ def Resblock_bn_DRU(input_tensor, channels, weight_decay = None):
                    padding="same"
                    )(active2)
     batchnorm3 = BatchNormalization()(conv3)
-    residual = Add()([input_tensor, batchnorm3])
+
+    se_feature = se_module(batchnorm3)
+    se_feature = K.expand_dims(se_feature, axis=1)
+    se_feature = K.expand_dims(se_feature, axis=1)
+    rescaled = tf.multiply(se_feature, batchnorm3)
+
+    residual = Add()([input_tensor, rescaled])
     active3 = Activation(activation="relu")(residual)
 
     return active3
 
-class DeepResUNet :
+class DeepResUNet_SE :
     """
     CODE INFO
     """
 
-    def __init__(self, input_size, lr, num_classes):
-        self.input_size = input_size
+    def __init__(self, input_shape, lr, num_classes):
+        self.input_shape = input_shape
         self.lr = lr
         self.num_classes = num_classes
-        #self.weight_decay = tf.keras.regularizers.L1L2(weight_decay)
 
     def build_net(self):
 
-        input = tf.keras.Input(self.input_size)
+        input = tf.keras.Input(self.input_shape)
 
         # Encoder - Input parts : 5x5 - Pool2
         En_conv5x5 = Conv2D(filters=128,
@@ -141,36 +135,36 @@ class DeepResUNet :
                                 strides=(2,2)
                                 )(En_Conv5x5_bn)
         # block1 : Resblock x 2, Pool2
-        En_rb1 = Resblock_bn_DRU(En_Max2x2_1,
+        En_rb1 = Resblock_bn_DRU_SE(En_Max2x2_1,
                                   64)
-        En_rb2 = Resblock_bn_DRU(En_rb1,
+        En_rb2 = Resblock_bn_DRU_SE(En_rb1,
                                   64)
         En_add1 = Add()([En_Max2x2_1, En_rb2])
         En_pool1 = MaxPool2D(pool_size=(2,2),
                              strides=(2,2)
                              )(En_add1)
         # block2 : Resblock x 2, Pool2
-        En_rb3 = Resblock_bn_DRU(En_pool1,
+        En_rb3 = Resblock_bn_DRU_SE(En_pool1,
                                   64)
-        En_rb4 = Resblock_bn_DRU(En_rb3,
+        En_rb4 = Resblock_bn_DRU_SE(En_rb3,
                                   64)
         En_add2 = Add()([En_rb4, En_pool1])
         En_pool2 = MaxPool2D(pool_size=(2,2),
                              strides=(2,2)
                              )(En_add2)
         # block3 : Resblock x 2, Pool2
-        En_rb5 = Resblock_bn_DRU(En_pool2,
+        En_rb5 = Resblock_bn_DRU_SE(En_pool2,
                                   64)
-        En_rb6 = Resblock_bn_DRU(En_rb5,
+        En_rb6 = Resblock_bn_DRU_SE(En_rb5,
                                   64)
         En_add3 = Add()([En_rb6, En_pool2])
         En_pool3 = MaxPool2D(pool_size=(2,2),
                              strides=(2,2)
                              )(En_add3)
         # block4 : Resblock x 2
-        En_rb7 = Resblock_bn_DRU(En_pool3,
+        En_rb7 = Resblock_bn_DRU_SE(En_pool3,
                                   64)
-        En_rb8 = Resblock_bn_DRU(En_rb7,
+        En_rb8 = Resblock_bn_DRU_SE(En_rb7,
                                   64)
         En_add4 = Add()([En_rb8, En_pool3])
 
@@ -188,11 +182,11 @@ class DeepResUNet :
             strides=(1,1),
             kernel_initializer="he_normal"
         )(De_concat1)
-        De_rb1 = Resblock_bn_DRU(
+        De_rb1 = Resblock_bn_DRU_SE(
             De_conv1x1_1,
             64
         )
-        De_rb2 = Resblock_bn_DRU(
+        De_rb2 = Resblock_bn_DRU_SE(
             De_rb1,
             64
         )
@@ -209,11 +203,11 @@ class DeepResUNet :
             strides=(1,1),
             kernel_initializer="he_normal"
         )(De_concat2)
-        De_rb3 = Resblock_bn_DRU(
+        De_rb3 = Resblock_bn_DRU_SE(
             De_conv1x1_2,
             64
         )
-        De_rb4 = Resblock_bn_DRU(
+        De_rb4 = Resblock_bn_DRU_SE(
             De_rb3,
             64
         )
@@ -230,11 +224,11 @@ class DeepResUNet :
             strides=(1, 1),
             kernel_initializer="he_normal"
         )(De_concat3)
-        De_rb5 = Resblock_bn_DRU(
+        De_rb5 = Resblock_bn_DRU_SE(
             De_conv1x1_3,
             64
         )
-        De_rb6 = Resblock_bn_DRU(
+        De_rb6 = Resblock_bn_DRU_SE(
             De_rb5,
             64
         )
@@ -251,11 +245,11 @@ class DeepResUNet :
             strides=(1, 1),
             kernel_initializer="he_normal"
         )(De_concat4)
-        De_rb7 = Resblock_bn_DRU(
+        De_rb7 = Resblock_bn_DRU_SE(
             De_conv1x1_4,
             64
         )
-        De_rb8 = Resblock_bn_DRU(
+        De_rb8 = Resblock_bn_DRU_SE(
             De_rb7,
             64
         )
@@ -266,19 +260,12 @@ class DeepResUNet :
         )(De_rb8)
 
         De_last = Activation(activation="softmax")(De_conv1x1_5)
-        #normalize_activation = Lambda(lambda x : x / tf.reduce_sum(x, len(x.get_shape())-1, True), name="normalize_active")(De_last)
-        clip_activation = Lambda(lambda x : tf.clip_by_value(x, 1e-4, 1.-1e-4))(De_last)
-        log_activation = Lambda(lambda x : K.log(x))(clip_activation)
 
-        weight_map_ip = tf.keras.Input(shape=self.input_size[:2] + (self.num_classes,))
-        weighted_softmax = multiply([log_activation, weight_map_ip])
-
-        model = tf.keras.Model(inputs=(input, weight_map_ip), outputs=weighted_softmax)
-        #model = keras.Model(inputs=input, outputs=log_activation)
+        model = tf.keras.Model(inputs=input, outputs=De_last)
 
         model.compile(
-            optimizer=tf.keras.optimizers.Adam(self.lr),
-            loss=cust_loss,
+            optimizer=tf.keras.optimizers.Adam(learning_rate=self.lr),
+            loss=SparseCategoricalCrossentropy(),
             metrics=UpdatedMeanIoU(num_classes=self.num_classes)
         )
 
@@ -288,9 +275,18 @@ if __name__ == "__main__" :
 
     INPUT_SHAPE = (512, 512, 3)
     NUM_CLASSES = 2
-    LR = 1e-4
-    BATCH_SIZE = 6
-    seed=10
+    start_lr = 0.0001
+    end_lr = 0.000001
+    decay_step = 100
+    LR = tf.keras.optimizers.schedules.PolynomialDecay(
+        start_lr,
+        decay_steps=decay_step,
+        end_learning_rate=end_lr,
+        power=0.5
+    )
+    # LR = 0.00001
+    BATCH_SIZE = 4
+    seed = 10
 
     # train
     image_datagen = ImageDataGenerator(
@@ -301,30 +297,17 @@ if __name__ == "__main__" :
         horizontal_flip=True,
         vertical_flip=True,
     )
-    weight_datagen = ImageDataGenerator(
-        horizontal_flip=True,
-        vertical_flip=True,
-    )
+
     image_generator = image_datagen.flow_from_directory(
-       directory="./swham/train/images",
-       class_mode=None,
-       seed=seed,
-       shuffle=True,
-       target_size=(512, 512),
-       batch_size=BATCH_SIZE
+        directory="./swham/train/images",
+        class_mode=None,
+        seed=seed,
+        shuffle=True,
+        target_size=(512, 512),
+        batch_size=BATCH_SIZE
     )
     mask_generator = mask_datagen_main.flow_from_directory(
-       directory="./swham/train/annotations",
-       class_mode=None,
-       seed=seed,
-       shuffle=True,
-       target_size=(512, 512),
-       color_mode="grayscale",
-       batch_size=BATCH_SIZE
-    )
-    weight_generator = weight_datagen.flow_from_directory(
-        directory="./swham/train/weights_normal"
-                  "",
+        directory="./swham/train/annotations",
         class_mode=None,
         seed=seed,
         shuffle=True,
@@ -336,7 +319,7 @@ if __name__ == "__main__" :
     # valid
     valid_img_datagen = ImageDataGenerator()
     valid_msk_datagen = ImageDataGenerator()
-    valid_weight_datagen = ImageDataGenerator()
+
     valid_img_generator = valid_img_datagen.flow_from_directory(
         directory="./swham/val/images",
         target_size=(512, 512),
@@ -354,39 +337,41 @@ if __name__ == "__main__" :
         color_mode="grayscale",
         batch_size=BATCH_SIZE
     )
-    valid_weight_generator = valid_weight_datagen.flow_from_directory(
-        directory="./swham/val/weights",
-        target_size=(512, 512),
-        seed=seed,
-        shuffle=True,
-        class_mode=None,
-        color_mode="grayscale",
-        batch_size=BATCH_SIZE
-    )
 
-    def create_train_generator(img, weight, label):
+
+    def create_train_generator(img, label):
         while True:
-            for x1, x2, x3 in zip(img, weight, label):
-                yield [x1, x2], x3
+            for x1, x2 in zip(img, label):
+                yield x1, x2
 
-    train_gen = create_train_generator(image_generator, weight_generator, mask_generator)
-    valid_gen = create_train_generator(valid_img_generator, valid_weight_generator, valid_mask_generator)
+    train_gen = create_train_generator(image_generator, mask_generator)
+    valid_gen = create_train_generator(valid_img_generator, valid_mask_generator)
 
-    DeepResUNet = DeepResUNet(input_size=INPUT_SHAPE, lr=LR, num_classes=NUM_CLASSES)
-    model = DeepResUNet.build_net()
-    # model.load_weights("./nw_weights/DRU_60.hdf5")
+    # pred_img_datagen = ImageDataGenerator()
+    #
+    # pred_img_generator = pred_img_datagen.flow_from_directory(
+    #     directory="./data_for_sangam_pred/dist5_clipped",
+    #     target_size=(512, 512),
+    #     batch_size=1,
+    #     shuffle=False,
+    #     class_mode=None
+    # )
+    # pred_gen = create_train_generator(pred_img_generator, pred_offground_generator, pred_ground_generator)
+
+    DRU_SE = DeepResUNet_SE(input_shape=INPUT_SHAPE, lr=LR, num_classes=NUM_CLASSES)
+    model = DRU_SE.build_net()
+    model.load_weights("./DRU_SE_rgb/weights/DRU_SE_rgb_62.hdf5")
     model.summary()
 
     # # visualization
-    # file_writer_img = tf.summary.create_file_writer('./nw_visual')
+    # file_writer_img = tf.summary.create_file_writer('./renewal_dataset_0324_vis')
     # val_to_visualize = next(valid_gen)
     # trn_to_visualize = next(train_gen)
     #
     # with file_writer_img.as_default():
-    #     tf.summary.image("TRN_IMAGE", trn_to_visualize[0][0]/255, step=0, max_outputs=BATCH_SIZE)
+    #     tf.summary.image("TRN_IMAGE", trn_to_visualize[0]/255, step=0, max_outputs=BATCH_SIZE)
     #     tf.summary.image("TRN_LABEL", trn_to_visualize[1], step=0, max_outputs=BATCH_SIZE)
-    #     tf.summary.image("TRN_WEIGHT", trn_to_visualize[0][1], step=0, max_outputs=BATCH_SIZE)
-    #     tf.summary.image("VAL_IMAGE", val_to_visualize[0][0]/255, step=0, max_outputs=BATCH_SIZE)
+    #     tf.summary.image("VAL_IMAGE", val_to_visualize[0]/255, step=0, max_outputs=BATCH_SIZE)
     #     tf.summary.image("VAL_LABEL", val_to_visualize[1], step=0, max_outputs=BATCH_SIZE)
     #
     # def log_val_img(epoch, logs):
@@ -397,21 +382,33 @@ if __name__ == "__main__" :
     #         tf.summary.image("TRN_PRED", trn_pred, step=epoch, max_outputs=BATCH_SIZE)
     #
     # VISUALIZE = tf.keras.callbacks.LambdaCallback(on_epoch_end=log_val_img)
-    #
-    # callbacks = [
-    #     tf.keras.callbacks.ModelCheckpoint(filepath="./nw_weights/DRU_{epoch:02d}.hdf5"),
-    #     tf.keras.callbacks.TensorBoard(log_dir="./nw_logs", update_freq="batch"),
-    #     VISUALIZE
-    #     #keras.callbacks.LearningRateScheduler(scheduler, verbose=1)
-    # ]
-    #
-    # model.fit(
-    #     train_gen,
-    #     initial_epoch=60,
-    #     validation_data=valid_gen,
-    #     validation_batch_size=BATCH_SIZE,
-    #     validation_steps=valid_img_generator.samples/BATCH_SIZE,
-    #     steps_per_epoch=mask_generator.samples/BATCH_SIZE,
-    #     epochs=100,
-    #     callbacks=[callbacks]
-    # )
+
+    callbacks = [
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath="./DRU_SE_rgb/weights/DRU_SE_rgb_{epoch:02d}.hdf5"),
+        tf.keras.callbacks.TensorBoard(log_dir="./DRU_SE_rgb/logs", update_freq="batch"),
+        # VISUALIZE
+        # keras.callbacks.LearningRateScheduler(scheduler, verbose=1)
+    ]
+
+    model.fit(
+        train_gen,
+        initial_epoch=63,
+        validation_data=valid_gen,
+        validation_batch_size=BATCH_SIZE,
+        validation_steps=valid_img_generator.samples / BATCH_SIZE,
+        steps_per_epoch=mask_generator.samples / BATCH_SIZE,
+        epochs=100,
+        callbacks=[callbacks]
+    )
+
+    # for data, name in zip(pred_img_generator, pred_img_generator.filenames):
+    #     name = str(name).split('/')[-1].split('\\')[-1].split('.')[0]
+    #     pred_test = model.predict(
+    #         data,
+    #         batch_size=1,
+    #         verbose=1,
+    #         steps=pred_img_generator.samples / 1.
+    #     )
+    #     print(pred_test.shape)
+    #     class2color(pred_test, name)

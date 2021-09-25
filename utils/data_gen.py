@@ -122,6 +122,7 @@ if __name__ == "__main__" :
         )
 
         DATA_SET = zip(IMG_GENERATOR, MSK_GENERATOR)
-        length = IMG_GENERATOR.samples
 
-        return DATA_SET, length
+        return DATA_SET
+
+    datagen()
